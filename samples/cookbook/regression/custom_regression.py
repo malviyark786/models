@@ -1,163 +1,399 @@
-# Copyright 2016 The TensorFlow Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Regression using the DNNRegressor Estimator."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import argparse
+import os
+
+import model
 
 import tensorflow as tf
 
-import automobile_data
+print('TF Version')
+print(tf.__version__)
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--batch_size', default=100, type=int, help='batch size')
-parser.add_argument('--train_steps', default=1000, type=int,
-                    help='number of training steps')
-parser.add_argument('--price_norm_factor', default=1000., type=float,
-                    help='price normalization factor')
-
-def my_dnn_regression_fn(features, labels, mode, params):
-  """A model function implementing DNN regression for a custom Estimator."""
-
-  # Extract the input into a dense layer, according to the feature_columns.
-  top = tf.feature_column.input_layer(features, params["feature_columns"])
-
-  # Iterate over the "hidden_units" list of layer sizes, default is [20].
-  for units in params.get("hidden_units", [20]):
-    # Add a hidden layer, densely connected on top of the previous layer.
-    top = tf.layers.dense(inputs=top, units=units, activation=tf.nn.relu)
-
-  # Connect a linear output layer on top.
-  output_layer = tf.layers.dense(inputs=top, units=1)
-
-  # Reshape the output layer to a 1-dim Tensor to return predictions
-  predictions = tf.squeeze(output_layer, 1)
-
-  if mode == tf.estimator.ModeKeys.PREDICT:
-    # In `PREDICT` mode we only need to return predictions.
-    return tf.estimator.EstimatorSpec(
-        mode=mode, predictions={"price": predictions})
-
-  # Calculate loss using mean squared error
-  average_loss = tf.losses.mean_squared_error(labels, predictions)
-
-  # Pre-made estimators use the total_loss instead of the average,
-  # so report total_loss for compatibility.
-  batch_size = tf.shape(labels)[0]
-  total_loss = tf.to_float(batch_size) * average_loss
-
-  if mode == tf.estimator.ModeKeys.TRAIN:
-    optimizer = params.get("optimizer", tf.train.AdamOptimizer)
-    optimizer = optimizer(params.get("learning_rate", None))
-    train_op = optimizer.minimize(
-        loss=average_loss, global_step=tf.train.get_global_step())
-
-    return tf.estimator.EstimatorSpec(
-        mode=mode, loss=total_loss, train_op=train_op)
-
-  # In evaluation mode we will calculate evaluation metrics.
-  assert mode == tf.estimator.ModeKeys.EVAL
-
-  # Calculate root mean squared error
-  print(labels)
-  print(predictions)
-
-  # Fixed for #4083
-  predictions = tf.cast(predictions, tf.float64)
-
-  rmse = tf.metrics.root_mean_squared_error(labels, predictions)
-
-  # Add the rmse to the collection of evaluation metrics.
-  eval_metrics = {"rmse": rmse}
-
-  return tf.estimator.EstimatorSpec(
-      mode=mode,
-      # Report sum of error for compatibility with pre-made estimators
-      loss=total_loss,
-      eval_metric_ops=eval_metrics)
+from tensorflow.python.util.deprecation import deprecated
+from tensorflow.contrib.learn.python.learn import learn_runner
+from tensorflow.contrib.learn.python.learn.estimators import run_config
+from tensorflow.contrib.learn.python.learn.utils import (
+    saved_model_export_utils)
+from tensorflow.contrib.training.python.training import hparam
 
 
-def main(argv):
-  """Builds, trains, and evaluates the model."""
-  args = parser.parse_args(argv[1:])
+def generate_experiment_fn(**experiment_args):
+  """Create an experiment function.
 
-  (train_x,train_y), (test_x, test_y) = automobile_data.load_data()
+  See command line help text for description of args.
+  Args:
+    experiment_args: keyword arguments to be passed through to experiment
+      See `tf.contrib.learn.Experiment` for full args.
+  Returns:
+    A function:
+      (tf.contrib.learn.RunConfig, tf.contrib.training.HParams) -> Experiment
 
-  train_y /= args.price_norm_factor
-  test_y /= args.price_norm_factor
-
-  # Provide the training input dataset.
-  train_input_fn = automobile_data.make_dataset(args.batch_size, train_x, train_y, True, 1000)
-
-  # Build the validation dataset.
-  test_input_fn = automobile_data.make_dataset(args.batch_size, test_x, test_y)
-
-  # The first way assigns a unique weight to each category. To do this you must
-  # specify the category's vocabulary (values outside this specification will
-  # receive a weight of zero). Here we specify the vocabulary using a list of
-  # options. The vocabulary can also be specified with a vocabulary file (using
-  # `categorical_column_with_vocabulary_file`). For features covering a
-  # range of positive integers use `categorical_column_with_identity`.
-  body_style_vocab = ["hardtop", "wagon", "sedan", "hatchback", "convertible"]
-  body_style = tf.feature_column.categorical_column_with_vocabulary_list(
-      key="body-style", vocabulary_list=body_style_vocab)
-  make = tf.feature_column.categorical_column_with_hash_bucket(
-      key="make", hash_bucket_size=50)
-
-  feature_columns = [
-      tf.feature_column.numeric_column(key="curb-weight"),
-      tf.feature_column.numeric_column(key="highway-mpg"),
-      # Since this is a DNN model, convert categorical columns from sparse
-      # to dense.
-      # Wrap them in an `indicator_column` to create a
-      # one-hot vector from the input.
-      tf.feature_column.indicator_column(body_style),
-      # Or use an `embedding_column` to create a trainable vector for each
-      # index.
-      tf.feature_column.embedding_column(make, dimension=3),
-  ]
-
-  # Build a custom Estimator, using the model_fn.
-  # `params` is passed through to the `model_fn`.
-  model = tf.estimator.Estimator(
-      model_fn=my_dnn_regression_fn,
-      params={
-          "feature_columns": feature_columns,
-          "learning_rate": 0.001,
-          "optimizer": tf.train.AdamOptimizer,
-          "hidden_units": [20, 20]
-      })
-
-  # Train the model.
-  model.train(input_fn=train_input_fn, steps=args.train_steps)
-
-  # Evaluate how the model performs on data it has not yet seen.
-  eval_result = model.evaluate(input_fn=test_input_fn)
-
-  # Print the Root Mean Square Error (RMSE).
-  print("\n" + 80 * "*")
-  print("\nRMS error for the test set: ${:.0f}"
-        .format(args.price_norm_factor * eval_result["rmse"]))
-
-  print()
+    This function is used by learn_runner to create an Experiment which
+    executes model code provided in the form of an Estimator and
+    input functions.
+  """
+  def _experiment_fn(run_config, hparams):
+    # num_epochs can control duration if train_steps isn't
+    # passed to Experiment
+    
+    train_input = lambda: model.generate_input_fn(
+        hparams.train_files,
+        num_epochs=hparams.num_epochs,
+        batch_size=hparams.train_batch_size,
+    )
+    # Don't shuffle evaluation data
+    eval_input = lambda: model.generate_input_fn(
+        hparams.eval_files,
+        batch_size=hparams.eval_batch_size,
+        shuffle=False,
+    )
+    return tf.contrib.learn.Experiment(
+        model.build_estimator(
+            hparams_dict=hparams.values(),
+            classes_files=hparams.classes_files,
+            embedding_size=hparams.embedding_size,
+            # Construct layers sizes with exponetial decay
+            hidden_units=[
+                max(2, int(hparams.first_layer_size *
+                           hparams.scale_factor**i))
+                for i in range(hparams.num_layers)
+            ],
+            config=run_config
+        ),
+        train_input_fn=train_input,
+        eval_input_fn=eval_input,
+        **experiment_args
+    )
+  return _experiment_fn
 
 
-if __name__ == "__main__":
-  # The Estimator periodically generates "INFO" logs; make these logs visible.
-  tf.logging.set_verbosity(tf.logging.INFO)
-  tf.app.run(main=main)
+if __name__ == '__main__':
+  parser = argparse.ArgumentParser()
+  # Input Arguments
+  parser.add_argument(
+      '--train-files',
+      help='GCS or local paths to training data',
+      nargs='+',
+      required=True
+  )
+  parser.add_argument(
+      '--classes-files',
+      help='GCS or local paths to classes data',
+      nargs='+',
+      required=True
+  )
+  parser.add_argument(
+      '--num-epochs',
+      help="""\
+      Maximum number of training data epochs on which to train.
+      If both --max-steps and --num-epochs are specified,
+      the training job will run for --max-steps or --num-epochs,
+      whichever occurs first. If unspecified will run for --max-steps.\
+      """,
+      type=int,
+  )
+  parser.add_argument(
+      '--train-batch-size',
+      help='Batch size for training steps',
+      type=int,
+      default=40
+  )
+  parser.add_argument(
+      '--eval-batch-size',
+      help='Batch size for evaluation steps',
+      type=int,
+      default=100
+  )
+  parser.add_argument(
+      '--eval-files',
+      help='GCS or local paths to evaluation data',
+      nargs='+',
+      required=True
+  )
+
+  # What features to use
+  parser.add_argument(
+      '--use-city',
+      help='If to use city',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='False',
+      required=False
+  )
+
+  parser.add_argument(
+      '--use-weather',
+      help='If to use weather',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='True',
+      required=False
+  )
+
+  parser.add_argument(
+      '--use-stat',
+      help='If to use stat',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='True',
+      required=False
+  )  
+
+  parser.add_argument(
+      '--use-cf',
+      help='If to use cf',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='True',
+      required=False
+  )
+
+  parser.add_argument(
+      '--use-ref',
+      help='If to use ref',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='False',
+      required=False
+  )
+
+  parser.add_argument(
+      '--use-path',
+      help='If to use path',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='False',
+      required=False
+  )
+
+  parser.add_argument(
+      '--use-tab',
+      help='If to use tab',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='False',
+      required=False
+  )
+
+  parser.add_argument(
+      '--use-time',
+      help='If to use time',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='True',
+      required=False
+  )
+
+  parser.add_argument(
+      '--use-country',
+      help='If to use use country',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='True',
+      required=False
+  )
+
+  parser.add_argument(
+      '--use-dist',
+      help='If to use use dist',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='True',
+      required=False
+  )
+
+  parser.add_argument(
+      '--use-mobile',
+      help='If to use use mobile',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='True',
+      required=False
+  )
+
+  parser.add_argument(
+      '--use-ubl',
+      help='If to use use ubl',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='True',
+      required=False
+  )
+
+  parser.add_argument(
+      '--use-expensive',
+      help='If to use use expensive',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='True',
+      required=False
+  )
+  
+  parser.add_argument(
+      '--use-visits',
+      help='If to use use visits',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='True',
+      required=False
+  )
+
+  parser.add_argument(
+      '--use-pagelang',
+      help='If to use use pagelang',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='True',
+      required=False
+  )
+
+  parser.add_argument(
+      '--use-position',
+      help='If to use use position',
+      choices=[
+          'True',
+          'False',
+      ],
+      default='True',
+      required=False
+  )
+
+  # Training arguments
+  parser.add_argument(
+      '--embedding-size',
+      help='Number of embedding dimensions for categorical columns',
+      default=6,
+      type=int
+  )
+  parser.add_argument(
+      '--first-layer-size',
+      help='Number of nodes in the first layer of the DNN',
+      default=100,
+      type=int
+  )
+  parser.add_argument(
+      '--num-layers',
+      help='Number of layers in the DNN',
+      default=4,
+      type=int
+  )
+  parser.add_argument(
+      '--scale-factor',
+      help='How quickly should the size of the layers in the DNN decay',
+      default=0.7,
+      type=float
+  )
+  parser.add_argument(
+      '--drop-out',
+      help='How much dropout',
+      default=0.3,
+      type=float
+  )  
+  parser.add_argument(
+      '--job-dir',
+      help='GCS location to write checkpoints and export models',
+      required=True
+  )
+
+  # Argument to turn on all logging
+  parser.add_argument(
+      '--verbosity',
+      choices=[
+          'DEBUG',
+          'ERROR',
+          'FATAL',
+          'INFO',
+          'WARN'
+      ],
+      default='INFO',
+  )
+  # Experiment arguments
+  parser.add_argument(
+      '--eval-delay-secs',
+      help='How long to wait before running first evaluation',
+      default=10,
+      type=int
+  )
+  parser.add_argument(
+      '--min-eval-frequency',
+      help='Minimum number of training steps between evaluations',
+      default=None,  # Use TensorFlow's default (currently, 1000 on GCS)
+      type=int
+  )
+  parser.add_argument(
+      '--train-steps',
+      help="""\
+      Steps to run the training job for. If --num-epochs is not specified,
+      this must be. Otherwise the training job will run indefinitely.\
+      """,
+      type=int
+  )
+  parser.add_argument(
+      '--eval-steps',
+      help='Number of steps to run evalution for at each checkpoint',
+      default=100,
+      type=int
+  )
+  parser.add_argument(
+      '--export-format',
+      help='The input format of the exported SavedModel binary',
+      choices=['JSON', 'CSV', 'EXAMPLE'],
+      default='JSON'
+  )
+
+  args = parser.parse_args()
+
+  # Set python level verbosity
+  tf.logging.set_verbosity(args.verbosity)
+  # Set C++ Graph Execution level verbosity
+  os.environ['TF_CPP_MIN_LOG_LEVEL'] = str(
+      tf.logging.__dict__[args.verbosity] / 10)
+
+  # Run the training job
+  # learn_runner pulls configuration information from environment
+  # variables using tf.learn.RunConfig and uses this configuration
+  # to conditionally execute Experiment, or param server code
+  learn_runner.run(
+      generate_experiment_fn(
+          min_eval_frequency=args.min_eval_frequency,
+          eval_delay_secs=args.eval_delay_secs,
+          train_steps=args.train_steps,
+          eval_steps=args.eval_steps,
+          export_strategies=[saved_model_export_utils.make_export_strategy(
+              model.SERVING_FUNCTIONS[args.export_format],
+              exports_to_keep=1,
+              default_output_alternative_key=None
+          )]
+      ),
+      run_config=run_config.RunConfig(model_dir=args.job_dir),
+      hparams=hparam.HParams(**args.__dict__)
+  )
